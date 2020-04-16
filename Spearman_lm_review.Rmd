@@ -1,0 +1,410 @@
+---
+title: "Spearman Correlation Coefficients and Regression Models"
+author: "Brett"
+date: "January 04, 2018"
+output: 
+  pdf_document: 
+    highlight: pygments
+    toc: true
+    toc_depth: 4
+---
+
+# Introduction: 
+This file compares the ability of functional parameters and *in silico* predictive tools to predict BrS1 and LQT3 penetrance. We include a test with glmer and show its limitations in our dataset. There is also a sensitivity analysis done at the end. 
+
+```{r setup, echo=FALSE, message=FALSE}
+require(Hmisc)
+library(tableone)
+library(ggplot2)
+library("DBI")
+library("RSQLite")
+library(wCorr)
+library(rms)
+library(boot)
+library(psych)
+library(reshape2)
+library(car)
+library(lme4)
+knitrSet(lang = 'markdown', echo = TRUE)
+```
+
+# Define Functions
+
+```{r functions, echo=TRUE}
+####### FUNCTIONS #########
+calcPval=function(xName,yName,weightName,nPerms,new.mat2){
+  # Pulls out variables
+
+  x=new.mat2[,xName] 
+  y=new.mat2[,yName] 
+  w=new.mat2[,weightName]
+  x2=x[!is.na(x)]
+  y2=y[!is.na(x)]
+  w2=w[!is.na(x)]
+
+  # Calculate the real correlation
+  realCorr=weightedCorr(x2,y2,method='spearman',weights=w2)
+  # Do permutations, calculate fake correlations
+  permutedCorrList=c()
+  for(permNum in 1:nPerms){
+    permutedX=sample(x2,length(x2),replace=FALSE)
+    wCorrSim=weightedCorr(permutedX,y2,method='spearman',weights=w2)
+    permutedCorrList=c(permutedCorrList,wCorrSim)
+  }
+  permutedCorrList2=abs(permutedCorrList)
+  realCorr2=abs(realCorr)
+  
+  # Calculate pvalue
+  summ=sum(realCorr2<permutedCorrList2)
+  pValue=summ/nPerms
+  return(list(realCorr,pValue,length(x2)))
+}
+
+calcAllPvals=function(yList,xList,nPerms,weightName,new.mat2){
+  i=0
+  resultTable=data.frame()
+  for(yName in yList){
+    for(xName in xList){
+      i=i+1
+      result=calcPval(xName,yName,weightName,nPerms,new.mat2)
+      resultTable[i,'x']=xName
+      resultTable[i,'y']=yName
+      resultTable[i,'nPerms']=nPerms
+      resultTable[i,'weightedCorr']=result[[1]]
+      resultTable[i,'pValue']=result[[2]]
+      resultTable[i,'n']=result[[3]]
+      #print(resultTable[i,'pValue'])
+    }
+  }
+  print(resultTable)
+  return(resultTable)
+}
+
+```
+
+# Read in data
+
+```{r data}
+
+con = dbConnect(SQLite(),
+dbname="/Users/Brett/Dropbox/SCN5A/BrettsSandbox/paper/data/VariantSCN5A-new.db")
+alltables = dbListTables(con)
+my.data <- dbReadTable(con, 'VariantSCN5A')
+my.data[my.data=='NA'] <- NA
+d<-my.data
+dbDisconnect(con)
+
+d$resnum<-as.integer(d$resnum)
+d$gnomAD[is.na(d$gnomAD)] <- 0
+d$gnomAD<-as.numeric(d$gnomAD)
+d$ipeak<-100*as.numeric(d$ipeak)
+d$vhalfact<-as.numeric(d$vhalfact)
+d$tauinact<-as.numeric(d$tauinact)
+d$vhalfinact<-as.numeric(d$vhalfinact)
+d$recovfrominact<-log10(100*as.numeric(d$recovfrominact))
+d$ilate[as.numeric(d$ilate)==0]<-NA
+d$ilate_norm<-log10(d$ipeak*as.numeric(d$ilate)+0.00001)
+d$ilate<-log10(100*as.numeric(d$ilate)+0.00001)
+d$total_carriers<-d$lqt3+d$brs1+d$unaff+d$gnomAD
+d$weight = 1-1/(0.1+d$total_carriers) #weights
+d$weightsMilder = 1-1/(1+d$total_carriers) #weights
+d$noweights = rep(1,length(d$total_carriers))
+
+servers<-read.csv("/Users/Brett/Dropbox/SCN5A/BrettsSandbox/paper/data/annotated_variants-trim.txt", sep = "\t")
+provean <-read.csv("/Users/Brett/Dropbox/SCN5A/BrettsSandbox/paper/data/provean.txt", sep = "\t")
+pph2 <-read.csv("/Users/Brett/Dropbox/SCN5A/BrettsSandbox/paper/data/pph2-short.txt", sep = "\t")
+sift <-read.csv("/Users/Brett/Dropbox/SCN5A/BrettsSandbox/paper/data/SIFT.txt", sep = "\t")
+d <- merge(d, servers, all = TRUE)
+d <- merge(d, provean, all = TRUE)
+d <- merge(d, sift, all = TRUE)
+d <- merge(d, pph2, all = TRUE)
+d<-d[!is.na(d$var), ]
+
+d$eaRate<-as.numeric(d$eaRate)
+d$blastpssm<-as.numeric(d$blastpssm)
+d$pamscore<-as.numeric(d$pamscore)
+
+# Adding in penetrance variables
+abrs0=0.32 
+alqt0=0.11 
+beta0=1 
+d$LQT_penetranceBayesian<-(d$lqt3+alqt0)/(d$total_carriers+beta0+alqt0)
+d$BrS_penetranceBayesian<-(d$brs1+abrs0)/(d$total_carriers+1+alqt0)
+d$all_penetranceBayesian<-(d$brs1+abrs0+d$lqt3+alqt0)/(d$total_carriers+beta0+alqt0+abrs0)
+e<-d
+```
+
+# Summary Statistics
+
+```{r table1}
+vari <- c('ipeak','ilate_norm','vhalfact','vhalfinact','recovfrominact','ilate')
+t1 <- CreateTableOne(vars = vari, data=d)
+print(t1, nonnormal=vari)
+```
+
+# Fitting data with generalized linear mixed effects model
+standard deviation of error term suggest negligible influence of predictor ipeak (peak) current [or ilate (late current)]
+
+```{r glmer}
+
+e<-d[d$total_carriers>0,]
+
+fit_partialpool_glmer <- glmer(cbind(brs1, total_carriers - brs1) ~ (1|var) + ilate, data = e, family = binomial("logit"))
+print("glmer of BrS1 penetrance by late current (fixed, bad predictor) and variant (random intercept) covariates")
+arm::display(fit_partialpool_glmer)
+
+fit_partialpool_glmer <- glmer(cbind(brs1, total_carriers - brs1) ~ (1|var) + ipeak, data = e, family = binomial("logit"), weights = weightsMilder)
+print("glmer of BrS1 penetrance by peak current (fixed, good predictor) and variant (random intercept) covariates")
+arm::display(fit_partialpool_glmer)
+
+e<-d
+```
+
+
+# Rank order correlations of functional parameters and predictive models to penetrance
+This part of the script compares Spearman rho's calculated using each functional parameter and predictive model against penetrance of BrS1 or LQT3 or both BrS1 and LQT3 (broad pathogenic classification)
+
+
+```{r compare_models}
+#only look at true nsSNPs
+d<-d[d$mut_type == "missense", ]
+
+# look only at ones with measured peak currents. 
+d<-d[!is.na(d$ipeak) | !is.na(d$ilate) | !is.na(d$vhalfact) 
+     | !is.na(d$vhalfinact) | !is.na(d$recovfrominact), ]
+d<-d[d$total_carriers>0, ]
+d<-d[d$LQT_penetranceBayesian>.20, ]
+
+yList=c('BrS_penetranceBayesian','LQT_penetranceBayesian', 'all_penetranceBayesian')
+xList=c('ipeak','ilate_norm','ilate','vhalfact','vhalfinact', 'tauinact', 
+        'recovfrominact','eaRate',
+        'pph2_prob', 'SIFT.Score', 'provean_score', 'CADD_raw', 'blastpssm',
+        'pamscore', 'aasimilaritymat')
+resultTable<-calcAllPvals(yList, xList, 1000, 'weight', d)
+
+```
+
+# Predictive models
+Simple linear models using peak current (ipeak), v1/2 activation, and PROVEAN (in silico predictive tool) to predict BrS1 and late current (ilate_norm), recovery from inactivation, and PROVEAN to predict LQT3 penetrance. 
+
+
+```{r compare_predictions}
+
+e<-e[e$total_carriers>0, ]
+
+#only evaluate true  missense SNPs
+e<-e[e$mut_type == "missense"
+     & !is.na(e$provean_score), ]
+
+# look only at ones with measured peak currents. 
+b<-e[!is.na(e$ipeak), ]
+
+
+print("Now select only missense variants where some functional characterization exists. This is done so that in silico predictive models have the same records for comparison with functional parameters.")
+
+print("restricted cubic spline of peak current predicting BrS1 penetrance")
+ln_brs_peak<-lm(b$BrS_penetranceBayesian~rcs(b$ipeak,4), weights=b$weight)
+
+print("restricted cubic spline of peak current and linear PROVEAN predicting BrS1 penetrance")
+ln_brs_peak_prov<-lm(b$BrS_penetranceBayesian~rcs(b$ipeak,4)+b$provean_score, weights=b$weight)
+
+print("linear PROVEAN predicting BrS1 penetrance")
+ln_brs_prov<-lm(b$BrS_penetranceBayesian~b$provean_score, weights=b$weight)
+
+print("linear PROVEAN predicting LQT3 penetrance")
+ln_lqt_prov<-lm(b$LQT_penetranceBayesian~b$provean_score, weights=b$weight)
+
+print("restricted cubic spline of peak current predicting BrS1 penetrance")
+ln_lqt_peak<-lm(b$LQT_penetranceBayesian~rcs(b$ipeak,4), weights=b$weight)
+
+print("restricted cubic spline of peak current and linear PROVEAN predicting LQT penetrance")
+ln_lqt_peak_prov<-lm(b$LQT_penetranceBayesian~rcs(b$ipeak,4)+b$provean_score, weights=b$weight)
+
+summary(ln_lqt_peak_prov)
+summary(ln_brs_peak_prov)
+summary(ln_brs_prov)
+summary(ln_lqt_prov)
+anova(ln_brs_peak_prov)
+anova(ln_lqt_peak_prov)
+AIC(ln_brs_prov)
+AIC(ln_brs_peak_prov)
+AIC(ln_brs_peak)
+AIC(ln_lqt_peak_prov)
+AIC(ln_lqt_peak)
+AIC(ln_lqt_prov)
+
+
+#only include variants with measured late current
+l<-e[!is.na(e$ilate), ]
+
+print("linear PROVEAN predicting LQT3 penetrance")
+ln_lqt_prov<-lm(l$LQT_penetranceBayesian~l$provean_score, weights=l$weight)
+
+print("linear non-normalized late current predicting LQT3 penetrance")
+ln_lqt_late <-lm(l$LQT_penetranceBayesian~l$ilate, weights=l$weight)
+
+print("linear non-normalized late current and PROVEAN predicting LQT3 penetrance")
+ln_lqt_late_prov <-lm(l$LQT_penetranceBayesian~l$ilate+l$provean_score, weights=l$weight)
+
+print("linear PROVEAN predicting BrS3 penetrance")
+ln_brs_prov<-lm(l$BrS_penetranceBayesian~l$provean_score, weights=l$weight)
+
+print("linear non-normalized late current predicting BrS3 penetrance")
+ln_brs_late <-lm(l$BrS_penetranceBayesian~l$ilate, weights=l$weight)
+
+print("linear non-normalized late current and PROVEAN predicting BrS3 penetrance")
+ln_brs_late_prov <-lm(l$BrS_penetranceBayesian~l$ilate+l$provean_score, weights=l$weight)
+
+summary(ln_lqt_late_prov)
+summary(ln_brs_late_prov)
+anova(ln_brs_late_prov)
+anova(ln_lqt_late_prov)
+AIC(ln_brs_prov)
+AIC(ln_brs_late_prov)
+AIC(ln_brs_late)
+AIC(ln_lqt_late_prov)
+AIC(ln_lqt_late)
+AIC(ln_lqt_prov)
+
+```
+
+# Correlation between functional parameters and *in silico* predictive tools
+
+```{r correlation_plot}
+
+rcor<-corr.test(d[c(15:17,19:22,40,47,50,53,23)], method = "pearson")
+rcor$r<-abs(rcor$r)
+
+p<-ggplot(melt(rcor$r), aes(Var1,ordered(Var2, levels = rev(sort(unique(Var2))))))+ geom_tile(aes(fill = value), color = "white") + scale_fill_gradient(low = "white", high = "steelblue") 
+
+#ordered(Var2, levels = rev(sort(unique(Var2))))
+base_size<-9
+
+p+ theme_grey(base_size = base_size) + labs(x = "", y = "") + 
+  scale_x_discrete(expand = c(0, 0)) + 
+  scale_y_discrete(expand = c(0, 0))  + theme(legend.position = "none", axis.text.x.top = element_text(angle = 90, vjust=0.5, hjust=0)) + scale_x_discrete(position = "top")
+
+
+```
+
+# Sensitivity Analysis
+This part of the script compares Spearman rho's calculated using each functional parameter and predictive model against penetrance of BrS1 or LQT3 or both BrS1 and LQT3 (more like the broad pathogenic classification) using different priors (empirical Bayes, optimistic, uninformative, and pessimistic)
+
+###Empirical Bayes (used in manuscript)
+
+```{r empirical}
+
+# Adding in penetrance variables
+abrs0=0.32 
+alqt0=0.11  
+beta0=1 
+d$LQT_penetranceBayesian<-(d$lqt3+alqt0)/(d$total_carriers+beta0+alqt0)
+d$BrS_penetranceBayesian<-(d$brs1+abrs0)/(d$total_carriers+1+alqt0)
+d$all_penetranceBayesian<-(d$brs1+abrs0+d$lqt3+alqt0)/(d$total_carriers+beta0+alqt0+abrs0)
+
+#only look at true nsSNPs
+d<-d[d$mut_type == "missense", ]
+
+# look only at ones with measured peak currents. 
+d<-d[!is.na(d$ipeak) | !is.na(d$ilate) | !is.na(d$vhalfact) 
+     | !is.na(d$vhalfinact) | !is.na(d$recovfrominact), ]
+d<-d[d$total_carriers>0, ]
+
+yList=c('BrS_penetranceBayesian','LQT_penetranceBayesian', 'all_penetranceBayesian')
+xList=c('ipeak','ilate_norm','ilate','vhalfact','vhalfinact', 'tauinact', 
+        'recovfrominact','eaRate',
+        'pph2_prob', 'SIFT.Score', 'provean_score', 'CADD_raw', 'blastpssm',
+        'pamscore', 'aasimilaritymat')
+resultTable<-calcAllPvals(yList, xList, 1000, 'weight', d)
+
+```
+
+
+###Uninformative Prior
+
+```{r uninformative}
+
+# Adding in penetrance variables
+abrs0=1
+alqt0=1
+beta0=1 
+d$LQT_penetranceBayesian<-(d$lqt3+alqt0)/(d$total_carriers+beta0+alqt0)
+d$BrS_penetranceBayesian<-(d$brs1+abrs0)/(d$total_carriers+1+alqt0)
+d$all_penetranceBayesian<-(d$brs1+abrs0+d$lqt3+alqt0)/(d$total_carriers+beta0+alqt0+abrs0)
+
+#only look at true nsSNPs
+d<-d[d$mut_type == "missense", ]
+
+# look only at ones with measured peak currents. 
+d<-d[!is.na(d$ipeak) | !is.na(d$ilate) | !is.na(d$vhalfact) 
+     | !is.na(d$vhalfinact) | !is.na(d$recovfrominact), ]
+d<-d[d$total_carriers>0, ]
+
+yList=c('BrS_penetranceBayesian','LQT_penetranceBayesian', 'all_penetranceBayesian')
+xList=c('ipeak','ilate_norm','ilate','vhalfact','vhalfinact', 'tauinact', 
+        'recovfrominact','eaRate',
+        'pph2_prob', 'SIFT.Score', 'provean_score', 'CADD_raw', 'blastpssm',
+        'pamscore', 'aasimilaritymat')
+resultTable<-calcAllPvals(yList, xList, 1000, 'weight', d)
+
+```
+
+###Optimistic Prior
+
+```{r optimistic}
+# Changing penetrance calculation to optimistic (no affected carriers)
+abrs0=0.01
+alqt0=0.01
+beta0=1 
+d$LQT_penetranceBayesian<-(d$lqt3+alqt0)/(d$total_carriers+beta0+alqt0)
+d$BrS_penetranceBayesian<-(d$brs1+abrs0)/(d$total_carriers+1+alqt0)
+d$all_penetranceBayesian<-(d$brs1+abrs0+d$lqt3+alqt0)/(d$total_carriers+beta0+alqt0+abrs0)
+
+#only look at true nsSNPs
+d<-d[d$mut_type == "missense", ]
+
+# look only at ones with measured peak currents. 
+d<-d[!is.na(d$ipeak) | !is.na(d$ilate) | !is.na(d$vhalfact) 
+     | !is.na(d$vhalfinact) | !is.na(d$recovfrominact), ]
+d<-d[d$total_carriers>0, ]
+
+yList=c('BrS_penetranceBayesian','LQT_penetranceBayesian', 'all_penetranceBayesian')
+xList=c('ipeak','ilate_norm','ilate','vhalfact','vhalfinact', 'tauinact', 
+        'recovfrominact','eaRate',
+        'pph2_prob', 'SIFT.Score', 'provean_score', 'CADD_raw', 'blastpssm',
+        'pamscore', 'aasimilaritymat')
+resultTable<-calcAllPvals(yList, xList, 1000, 'weight', d)
+
+```
+
+###Pessimistic Prior
+
+```{r pessimistic}
+# Changing penetrance calculation to pessimistic (one affected carrier)
+abrs0=1
+alqt0=1
+beta0=0.01 
+d$LQT_penetranceBayesian<-(d$lqt3+alqt0)/(d$total_carriers+beta0+alqt0)
+d$BrS_penetranceBayesian<-(d$brs1+abrs0)/(d$total_carriers+1+alqt0)
+d$all_penetranceBayesian<-(d$brs1+abrs0+d$lqt3+alqt0)/(d$total_carriers+beta0+alqt0+abrs0)
+
+#only look at true nsSNPs
+d<-d[d$mut_type == "missense", ]
+
+# look only at ones with measured peak currents. 
+d<-d[!is.na(d$ipeak) | !is.na(d$ilate) | !is.na(d$vhalfact) 
+     | !is.na(d$vhalfinact) | !is.na(d$recovfrominact), ]
+d<-d[d$total_carriers>0, ]
+
+yList=c('BrS_penetranceBayesian','LQT_penetranceBayesian', 'all_penetranceBayesian')
+xList=c('ipeak','ilate_norm','ilate','vhalfact','vhalfinact', 'tauinact', 
+        'recovfrominact','eaRate',
+        'pph2_prob', 'SIFT.Score', 'provean_score', 'CADD_raw', 'blastpssm',
+        'pamscore', 'aasimilaritymat')
+resultTable<-calcAllPvals(yList, xList, 1000, 'weight', d)
+
+```
+
+
+
+
